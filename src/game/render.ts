@@ -1,6 +1,6 @@
-import type { City, GameState, Owner, ResourceType } from './types';
-import { soldierPosition } from './engine';
-import { cityRadius, findEdgePath, MAP_HEIGHT, MAP_WIDTH, pointOnPath } from './map';
+import type { City, GameState, Owner, ResourceType, TerrainRegion } from './types';
+import { isCitySpied, soldierPosition } from './engine';
+import { cityRadius, findEdgePath, getTerrain, pointOnPath, TERRAIN_META } from './map';
 
 // 资源显示配置：标签 / 颜色
 const RESOURCE_META: Record<ResourceType, { icon: string; color: string }> = {
@@ -17,15 +17,17 @@ const COLORS: Record<Owner, { main: string; glow: string; dim: string }> = {
   neutral: { main: '#6b7480', glow: 'rgba(107,116,128,0.4)', dim: 'rgba(107,116,128,0.14)' },
 };
 
-// 预生成噪点纹理（世界尺寸，覆盖整张地图）
+// 预生成噪点纹理（按地图尺寸缓存，切换地图时重新生成）
 let noiseCanvas: HTMLCanvasElement | null = null;
-function getNoise(): HTMLCanvasElement {
-  if (noiseCanvas) return noiseCanvas;
+let noiseW = 0;
+let noiseH = 0;
+function getNoise(w: number, h: number): HTMLCanvasElement {
+  if (noiseCanvas && noiseW === w && noiseH === h) return noiseCanvas;
   const c = document.createElement('canvas');
-  c.width = MAP_WIDTH;
-  c.height = MAP_HEIGHT;
+  c.width = w;
+  c.height = h;
   const ctx = c.getContext('2d')!;
-  const img = ctx.createImageData(MAP_WIDTH, MAP_HEIGHT);
+  const img = ctx.createImageData(w, h);
   for (let i = 0; i < img.data.length; i += 4) {
     const v = Math.random() * 255;
     img.data[i] = v;
@@ -35,7 +37,27 @@ function getNoise(): HTMLCanvasElement {
   }
   ctx.putImageData(img, 0, 0);
   noiseCanvas = c;
+  noiseW = w;
+  noiseH = h;
   return c;
+}
+
+// 绘制地形区域背景
+function drawTerrain(ctx: CanvasRenderingContext2D, regions: TerrainRegion[], mapW: number, mapH: number) {
+  // 先填充平原底色
+  ctx.fillStyle = TERRAIN_META.plain.color;
+  ctx.fillRect(0, 0, mapW, mapH);
+  // 依次绘制各地形区域
+  for (const r of regions) {
+    ctx.fillStyle = TERRAIN_META[r.type].color;
+    if ('w' in r) {
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+    } else {
+      ctx.beginPath();
+      ctx.arc(r.cx, r.cy, r.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
 }
 
 export function render(ctx: CanvasRenderingContext2D, state: GameState, time: number) {
@@ -62,37 +84,40 @@ export function render(ctx: CanvasRenderingContext2D, state: GameState, time: nu
   ctx.scale(cam.scale, cam.scale);
   ctx.translate(-cam.x, -cam.y);
 
-  // 2. 战术网格（世界空间，覆盖整张地图）
+  // 2. 地形区域背景（世界空间）
+  drawTerrain(ctx, getTerrain(state.mapType), state.mapW, state.mapH);
+
+  // 3. 战术网格（世界空间，覆盖整张地图）
   ctx.strokeStyle = 'rgba(120,140,160,0.05)';
   ctx.lineWidth = 1;
   const grid = 40;
   ctx.beginPath();
-  for (let x = 0; x <= MAP_WIDTH; x += grid) {
+  for (let x = 0; x <= state.mapW; x += grid) {
     ctx.moveTo(x + 0.5, 0);
-    ctx.lineTo(x + 0.5, MAP_HEIGHT);
+    ctx.lineTo(x + 0.5, state.mapH);
   }
-  for (let y = 0; y <= MAP_HEIGHT; y += grid) {
+  for (let y = 0; y <= state.mapH; y += grid) {
     ctx.moveTo(0, y + 0.5);
-    ctx.lineTo(MAP_WIDTH, y + 0.5);
+    ctx.lineTo(state.mapW, y + 0.5);
   }
   ctx.stroke();
 
   // 加粗主网格线
   ctx.strokeStyle = 'rgba(120,140,160,0.08)';
   ctx.beginPath();
-  for (let x = 0; x <= MAP_WIDTH; x += grid * 4) {
+  for (let x = 0; x <= state.mapW; x += grid * 4) {
     ctx.moveTo(x + 0.5, 0);
-    ctx.lineTo(x + 0.5, MAP_HEIGHT);
+    ctx.lineTo(x + 0.5, state.mapH);
   }
-  for (let y = 0; y <= MAP_HEIGHT; y += grid * 4) {
+  for (let y = 0; y <= state.mapH; y += grid * 4) {
     ctx.moveTo(0, y + 0.5);
-    ctx.lineTo(MAP_WIDTH, y + 0.5);
+    ctx.lineTo(state.mapW, y + 0.5);
   }
   ctx.stroke();
 
-  // 3. 噪点纹理（世界空间）
+  // 4. 噪点纹理（世界空间，按地图尺寸缓存）
   ctx.globalAlpha = 0.5;
-  ctx.drawImage(getNoise(), 0, 0);
+  ctx.drawImage(getNoise(state.mapW, state.mapH), 0, 0);
   ctx.globalAlpha = 1;
 
   // 4. 邻接连线
@@ -126,6 +151,72 @@ export function render(ctx: CanvasRenderingContext2D, state: GameState, time: nu
       }
       drawArrow(ctx, from.x, from.y, state.dragTo.x, state.dragTo.y, valid, cityRadius(from.size));
     }
+  }
+
+  // 建造道路模式：源城市脉冲环
+  if (state.buildRoadFrom !== null) {
+    const src = state.cities[state.buildRoadFrom];
+    if (src) {
+      const r = cityRadius(src.size) + 8 + (Math.sin(time * 4) * 0.5 + 0.5) * 5;
+      ctx.strokeStyle = 'rgba(120,200,120,0.7)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(src.x, src.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // 改道模式：选中军队脉冲环
+  if (state.redirectFromArmyId !== null) {
+    const army = state.armies.find((a) => a.id === state.redirectFromArmyId);
+    if (army) {
+      const r = 20 + (Math.sin(time * 5) * 0.5 + 0.5) * 6;
+      ctx.strokeStyle = 'rgba(100,180,255,0.7)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(army.centerX, army.centerY, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // 地形查看：点击空白处显示该地块地形信息
+  if (state.terrainInspect) {
+    const ti = state.terrainInspect;
+    const meta = TERRAIN_META[ti.type];
+    // 标记点（十字 + 圆环）
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(ti.x, ti.y, 7, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(ti.x - 10, ti.y);
+    ctx.lineTo(ti.x + 10, ti.y);
+    ctx.moveTo(ti.x, ti.y - 10);
+    ctx.lineTo(ti.x, ti.y + 10);
+    ctx.stroke();
+    // 信息标签
+    const costStr = meta.cost.toFixed(1);
+    const label = `${meta.label} · 行军 ×${costStr}`;
+    ctx.font = '600 11px "JetBrains Mono", monospace';
+    const tw = ctx.measureText(label).width;
+    const boxW = tw + 16;
+    const boxH = 22;
+    const bx = ti.x + 12;
+    const by = ti.y - boxH - 6;
+    ctx.fillStyle = 'rgba(10,14,20,0.94)';
+    ctx.fillRect(bx, by, boxW, boxH);
+    ctx.strokeStyle = 'rgba(180,190,200,0.5)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bx + 0.5, by + 0.5, boxW - 1, boxH - 1);
+    ctx.fillStyle = '#e0e6ed';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, bx + 8, by + boxH / 2);
   }
 
   ctx.restore();
@@ -200,6 +291,21 @@ function drawArmies(ctx: CanvasRenderingContext2D, state: GameState, time: numbe
       ctx.stroke();
     }
 
+    // 驻扎指示：部队中心黄色方框 + 选中高亮
+    if (army.camped) {
+      const sz = 10 + Math.sin(time * 3) * 1.5;
+      ctx.strokeStyle = 'rgba(230,200,80,0.7)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(army.centerX - sz, army.centerY - sz, sz * 2, sz * 2);
+    }
+    if (state.selectedArmyId === army.id) {
+      ctx.strokeStyle = 'rgba(255,235,150,0.9)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(army.centerX, army.centerY, 16, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
     for (const s of army.soldiers) {
       if (!s.alive) continue;
       const pos = soldierPosition(army, from, to, s, time, state.cities);
@@ -228,7 +334,7 @@ function drawArmies(ctx: CanvasRenderingContext2D, state: GameState, time: numbe
       ctx.fillRect(Math.round(pos.x) - 1, Math.round(pos.y) - 1, 2, 2);
     }
 
-    // 兵力数值（飘在队伍上方）
+    // 兵力数值（飘在队伍上方）：己方显示数字，敌方显示 ?
     const aliveSoldiers = army.soldiers.filter((s) => s.alive);
     if (aliveSoldiers.length === 0) continue;
     const headProgress = Math.min(1, Math.max(...aliveSoldiers.map((s) => s.progress)));
@@ -241,7 +347,7 @@ function drawArmies(ctx: CanvasRenderingContext2D, state: GameState, time: numbe
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.fillRect(hx - 14, hy - 8, 28, 14);
     ctx.fillStyle = col.main;
-    ctx.fillText(String(Math.floor(army.count)), hx, hy);
+    ctx.fillText(army.owner === 'player' ? String(Math.floor(army.count)) : '?', hx, hy);
   }
 }
 
@@ -313,13 +419,14 @@ function drawCity(ctx: CanvasRenderingContext2D, c: City, state: GameState, time
     ctx.stroke();
   }
 
-  // 兵力数值（根据城市大小调整字号）
+  // 兵力数值：己方城池显示数字，敌方/中立显示 ?（刺探有效期内显示数字）
+  const showTroops = c.owner === 'player' || isCitySpied(state, c.id);
   const fontSize = c.size === 'large' ? 19 : c.size === 'medium' ? 17 : 15;
   ctx.font = `700 ${fontSize}px "JetBrains Mono", monospace`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = col.main;
-  ctx.fillText(String(Math.floor(c.troops)), c.x, c.y + 1);
+  ctx.fillText(showTroops ? String(Math.floor(c.troops)) : '?', c.x, c.y + 1);
 
   // 城市名（下方）
   ctx.font = '500 10px "Share Tech Mono", "JetBrains Mono", monospace';

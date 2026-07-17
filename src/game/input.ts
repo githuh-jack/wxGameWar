@@ -1,5 +1,6 @@
 import type { GameState } from './types';
-import { areAdjacent, dispatch, findCityAt, panCamera, zoomCamera } from './engine';
+import { areAdjacent, buildRoad, dispatch, findArmyAt, findCityAt, panCamera, redirectArmy, zoomCamera } from './engine';
+import { getTerrain, terrainAt } from './map';
 
 export interface InputHandlers {
   onSelect: () => void;
@@ -55,10 +56,35 @@ export function bindInput(
       lastSY = sy;
       const world = toWorld(sx, sy);
       const city = findCityAt(state, world.x, world.y);
+
+      // 建造道路模式：点击城市触发建路，点击空白取消
+      if (state.buildRoadFrom !== null) {
+        if (city && city.id !== state.buildRoadFrom && city.owner === 'player') {
+          buildRoad(state, state.buildRoadFrom, city.id);
+        }
+        state.buildRoadFrom = null;
+        handlers.onSelect();
+        e.preventDefault();
+        return;
+      }
+
+      // 改道模式：点击城市改道，点击空白取消
+      if (state.redirectFromArmyId !== null) {
+        if (city) {
+          redirectArmy(state, state.redirectFromArmyId, city.id);
+        }
+        state.redirectFromArmyId = null;
+        handlers.onSelect();
+        e.preventDefault();
+        return;
+      }
+
       if (city && city.owner === 'player') {
         // 拖拽己方城市 → 派遣模式
         mode = 'dispatch';
         state.selectedCityId = city.id;
+        state.selectedArmyId = null;
+        state.terrainInspect = null;
         state.isDragging = true;
         state.dragTo = { x: world.x, y: world.y };
         handlers.onSelect();
@@ -66,10 +92,21 @@ export function bindInput(
         // 点击非己方城市 → 仅选中查看
         mode = 'idle';
         state.selectedCityId = city.id;
+        state.selectedArmyId = null;
+        state.terrainInspect = null;
         handlers.onSelect();
       } else {
-        // 空白区域 → 平移模式
-        mode = 'pan';
+        // 空白区域：先检查是否点中己方军队，否则平移
+        const army = findArmyAt(state, world.x, world.y);
+        if (army) {
+          state.selectedArmyId = army.id;
+          state.selectedCityId = null;
+          state.terrainInspect = null;
+          handlers.onSelect();
+          mode = 'idle';
+        } else {
+          mode = 'pan';
+        }
       }
     } else if (pointers.size === 2) {
       // 双指按下 → 切换到缩放模式，取消派遣
@@ -129,16 +166,20 @@ export function bindInput(
       const world = toWorld(sx, sy);
       const target = findCityAt(state, world.x, world.y);
       if (target && target.id !== state.selectedCityId && areAdjacent(state, state.selectedCityId, target.id)) {
-        dispatch(state, state.selectedCityId, target.id, 0.5);
+        dispatch(state, state.selectedCityId, target.id);
         handlers.onDispatch();
       }
       state.isDragging = false;
       state.dragTo = null;
     } else if (wasMode === 'pan') {
-      // 如果几乎没移动，视为点击空白 → 取消选中
+      // 如果几乎没移动，视为点击空白 → 取消选中并查看地形
       const moved = Math.hypot(sx - startSX, sy - startSY);
       if (moved < 8) {
         state.selectedCityId = null;
+        state.selectedArmyId = null;
+        const world = toWorld(sx, sy);
+        const type = terrainAt(world.x, world.y, getTerrain(state.mapType));
+        state.terrainInspect = { x: world.x, y: world.y, type };
         handlers.onSelect();
       }
     }
